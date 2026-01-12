@@ -1,4 +1,3 @@
-import time
 import numpy as np
 import torch
 import gc
@@ -8,7 +7,7 @@ from .ops import approx_gelu
 
 
 class FHEBertTinyEncoder:
-    def __init__(self, engine, mult_key, hadamard_key, level=None):
+    def __init__(self, engine, mult_key, hadamard_key, level=None, ffn_w1_delta=5, ffn_w2_delta=7):
         self.engine = engine
         self.mult_key = mult_key
         self.hadamard_key = hadamard_key
@@ -16,8 +15,13 @@ class FHEBertTinyEncoder:
         self.hidden_size = 128
         self.ffn_size = 512
 
-        # ✅ level 从外部传入（可以是 None，表示用库默认 max）
+        # 初始 encode level（None 表示用库默认 max）
         self.level = level
+
+        # 你测出来的“从 init level 到 FFN 两次 matmul 前激活的 level 下降量”
+        # 默认按你现在的实验：W1 用 level-5，W2 用 level-7
+        self.ffn_w1_delta = ffn_w1_delta
+        self.ffn_w2_delta = ffn_w2_delta
 
         self._init_random_weights_cpu()
 
@@ -45,7 +49,7 @@ class FHEBertTinyEncoder:
         del w_k_pt
         torch.cuda.empty_cache()
 
-        # --- Score (ct-ct) ---
+        # --- Score ---
         print("     > [3/6] Computing Attention Score (Q * K)...")
         score = q.matmul(k, self.mult_key)
         del q, k
@@ -82,10 +86,19 @@ class FHEBertTinyEncoder:
         del output
         torch.cuda.empty_cache()
 
-        # --- FFN ---
-        print("     > [FFN] Linear 1...")
-        w_ff1_pt = BlockMatrix.encode_weights(self.engine, self.np_ff1, level=self.level)
+        # ===== FFN with level-aware weight encoding =====
+        if self.level is None:
+            # 没有指定初始 level 时，无法按 “level-Δ” 推导，退回默认
+            level_w1 = None
+            level_w2 = None
+        else:
+            level_w1 = max(1, self.level - self.ffn_w1_delta)
+            level_w2 = max(1, self.level - self.ffn_w2_delta)
+
+        print(f"     > [FFN] Linear 1 (encode level={level_w1})...")
+        w_ff1_pt = BlockMatrix.encode_weights(self.engine, self.np_ff1, level=level_w1)
         ff1 = attention_out.matmul(w_ff1_pt, self.mult_key)
+        print("[Check] W1 pt.level =", w_ff1_pt.blocks[0][0].level)
         del w_ff1_pt
         torch.cuda.empty_cache()
 
@@ -94,9 +107,10 @@ class FHEBertTinyEncoder:
         del ff1
         torch.cuda.empty_cache()
 
-        print("     > [FFN] Linear 2...")
-        w_ff2_pt = BlockMatrix.encode_weights(self.engine, self.np_ff2, level=self.level)
+        print(f"     > [FFN] Linear 2 (encode level={level_w2})...")
+        w_ff2_pt = BlockMatrix.encode_weights(self.engine, self.np_ff2, level=level_w2)
         ff2 = ff_gelu.matmul(w_ff2_pt, self.mult_key)
+        print("[Check] W2 pt.level =", w_ff2_pt.blocks[0][0].level)
         del w_ff2_pt, ff_gelu
         torch.cuda.empty_cache()
 
