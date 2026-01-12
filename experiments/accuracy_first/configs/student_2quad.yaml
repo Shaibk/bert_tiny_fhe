@@ -1,0 +1,43 @@
+seed: 42
+device: cuda
+dtype: fp32
+
+model:
+  variant: student
+  hidden_size: 128
+  num_layers: 2
+  num_heads: 2
+  intermediate_size: 512
+  dropout: 0.1
+  attention:
+    type: quad   # 2Quad: (x+c)^2 / sum
+    c: 3.0
+    eps: 1.0e-6
+  activation:
+    type: gelu_poly_learnable
+    init_a: 0.125
+    init_b: 0.25
+    init_d: 0.5
+
+distill:
+  use_kd: true
+  temperature: 3.0
+  lambda_ce: 1.0
+  lambda_logits: 1.0
+  lambda_attn: 1.0
+  lambda_hidden: 1.0
+
+train:
+  epochs: 5
+  batch_size: 32
+  lr: 3.0e-5
+  weight_decay: 0.01
+  max_grad_norm: 1.0
+
+data:
+  name: your_dataset
+  max_seq_len: 128
+
+output:
+  dir: outputs/accuracy_first/student_2quad
+  teacher_ckpt: outputs/accuracy_first/teacher/teacher.pt

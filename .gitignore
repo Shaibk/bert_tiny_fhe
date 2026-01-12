@@ -1,6 +1,48 @@
-# Python cache
+# ===== Python =====
 __pycache__/
-*.pyc
+*.py[cod]
+*.pyo
+*.pyd
+*.so
+*.egg-info/
+.eggs/
+.env
+.venv
+venv/
+ENV/
 
-# Experiment results / logs
-*.jsonl
+# ===== PyTorch / ML artifacts =====
+*.pt
+*.pth
+*.ckpt
+*.onnx
+*.npz
+
+# ===== Experiments / generated outputs =====
+experiments/**/results/
+experiments/**/logs/
+experiments/**/__pycache__/
+
+# ===== FHE / intermediate data =====
+fhe_layer*_weights.npz
+*_weights.npz
+
+# ===== Tools / generated scripts =====
+tools/*.log
+tools/__pycache__/
+
+# ===== Editor / OS =====
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# ===== CUDA / profiling =====
+*.nvvp
+*.nsys-rep
+*.qdrep
+
+# ===== Temporary files =====
+*.tmp
+*.swp
+*.swo

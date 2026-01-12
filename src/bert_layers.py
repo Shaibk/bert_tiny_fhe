@@ -7,7 +7,22 @@ from .ops import approx_gelu
 
 
 class FHEBertTinyEncoder:
-    def __init__(self, engine, mult_key, hadamard_key, level=None, ffn_w1_delta=5, ffn_w2_delta=7):
+    """
+    FHE 推理用 Tiny-BERT Encoder（单层 forward）
+    - 支持从 .npz 加载明文训练导出的权重（Wq/Wk/Wv/Wo/FF1/FF2）
+    - 若不提供 weights_path，则回退为随机初始化（用于benchmark/调试）
+    """
+
+    def __init__(
+        self,
+        engine,
+        mult_key,
+        hadamard_key,
+        level=None,
+        ffn_w1_delta=5,
+        ffn_w2_delta=7,
+        weights_path=None,
+    ):
         self.engine = engine
         self.mult_key = mult_key
         self.hadamard_key = hadamard_key
@@ -23,10 +38,17 @@ class FHEBertTinyEncoder:
         self.ffn_w1_delta = ffn_w1_delta
         self.ffn_w2_delta = ffn_w2_delta
 
-        self._init_random_weights_cpu()
+        # ===== 初始化权重（随机 or 从文件加载）=====
+        if weights_path is None:
+            self._init_random_weights_cpu()
+        else:
+            self._load_weights_cpu(weights_path)
 
+    # -------------------------
+    # Weight init / load
+    # -------------------------
     def _init_random_weights_cpu(self):
-        print("   [Init] Generating Weights on CPU...")
+        print("   [Init] Generating Random Weights on CPU...")
         self.np_wq = np.random.randn(self.hidden_size, self.hidden_size).astype(np.float32)
         self.np_wk = np.random.randn(self.hidden_size, self.hidden_size).astype(np.float32)
         self.np_wv = np.random.randn(self.hidden_size, self.hidden_size).astype(np.float32)
@@ -34,6 +56,39 @@ class FHEBertTinyEncoder:
         self.np_ff1 = np.random.randn(self.hidden_size, self.ffn_size).astype(np.float32)
         self.np_ff2 = np.random.randn(self.ffn_size, self.hidden_size).astype(np.float32)
 
+    def _load_weights_cpu(self, path: str):
+        """
+        从 tools/export_plain_weights_to_fhe_npz.py 导出的 .npz 读取权重。
+        期望包含 key：
+          np_wq, np_wk, np_wv, np_wo, np_ff1, np_ff2
+        并且形状分别为：
+          (H,H), (H,H), (H,H), (H,H), (H,FF), (FF,H)
+        """
+        print(f"   [Init] Loading weights from: {path}")
+        data = np.load(path)
+
+        self.np_wq = data["np_wq"].astype(np.float32)
+        self.np_wk = data["np_wk"].astype(np.float32)
+        self.np_wv = data["np_wv"].astype(np.float32)
+        self.np_wo = data["np_wo"].astype(np.float32)
+        self.np_ff1 = data["np_ff1"].astype(np.float32)
+        self.np_ff2 = data["np_ff2"].astype(np.float32)
+
+        # 形状检查，避免 silent mismatch
+        assert self.np_wq.shape == (self.hidden_size, self.hidden_size), f"np_wq shape {self.np_wq.shape}"
+        assert self.np_wk.shape == (self.hidden_size, self.hidden_size), f"np_wk shape {self.np_wk.shape}"
+        assert self.np_wv.shape == (self.hidden_size, self.hidden_size), f"np_wv shape {self.np_wv.shape}"
+        assert self.np_wo.shape == (self.hidden_size, self.hidden_size), f"np_wo shape {self.np_wo.shape}"
+        assert self.np_ff1.shape == (self.hidden_size, self.ffn_size), f"np_ff1 shape {self.np_ff1.shape}"
+        assert self.np_ff2.shape == (self.ffn_size, self.hidden_size), f"np_ff2 shape {self.np_ff2.shape}"
+
+        print("   [Init] Weights loaded OK.")
+        print(f"     np_wq: {self.np_wq.shape}  np_wk: {self.np_wk.shape}  np_wv: {self.np_wv.shape}")
+        print(f"     np_wo: {self.np_wo.shape}  np_ff1: {self.np_ff1.shape}  np_ff2: {self.np_ff2.shape}")
+
+    # -------------------------
+    # Forward (single layer)
+    # -------------------------
     def forward_one_layer(self, x_enc: BlockMatrix):
         # --- Q ---
         print("     > [1/6] Encoding W_Q & Computing Q...")
@@ -57,6 +112,7 @@ class FHEBertTinyEncoder:
         gc.collect()
 
         # --- Softmax approx ---
+        # 方案一：用平方替代 Softmax（当前实现等价于 p=2 / 2Quad(无常数c,无归一化) 的核心）
         print("     > [Softmax] Approx with Square...")
         attn_probs = score.square(self.hadamard_key)
         del score
@@ -82,6 +138,7 @@ class FHEBertTinyEncoder:
         del w_o_pt
         torch.cuda.empty_cache()
 
+        # Residual
         attention_out = x_enc.add(output)
         del output
         torch.cuda.empty_cache()
@@ -98,7 +155,10 @@ class FHEBertTinyEncoder:
         print(f"     > [FFN] Linear 1 (encode level={level_w1})...")
         w_ff1_pt = BlockMatrix.encode_weights(self.engine, self.np_ff1, level=level_w1)
         ff1 = attention_out.matmul(w_ff1_pt, self.mult_key)
-        print("[Check] W1 pt.level =", w_ff1_pt.blocks[0][0].level)
+        try:
+            print("[Check] W1 pt.level =", w_ff1_pt.blocks[0][0].level)
+        except Exception:
+            pass
         del w_ff1_pt
         torch.cuda.empty_cache()
 
@@ -110,7 +170,10 @@ class FHEBertTinyEncoder:
         print(f"     > [FFN] Linear 2 (encode level={level_w2})...")
         w_ff2_pt = BlockMatrix.encode_weights(self.engine, self.np_ff2, level=level_w2)
         ff2 = ff_gelu.matmul(w_ff2_pt, self.mult_key)
-        print("[Check] W2 pt.level =", w_ff2_pt.blocks[0][0].level)
+        try:
+            print("[Check] W2 pt.level =", w_ff2_pt.blocks[0][0].level)
+        except Exception:
+            pass
         del w_ff2_pt, ff_gelu
         torch.cuda.empty_cache()
 

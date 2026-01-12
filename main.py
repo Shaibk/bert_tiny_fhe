@@ -32,7 +32,7 @@ def run_bert_tiny_benchmark():
     
     # 4. 初始化模型 (传入 hadamard_key)
     print("3. [Server] Loading Model...")
-    bert = FHEBertTinyEncoder(engine, mult_key, hadamard_key)
+    bert = FHEBertTinyEncoder(engine, mult_key, hadamard_key, weights_path="fhe_layer0_weights.npz")
     
     # ... (后续代码不变) ...
     
