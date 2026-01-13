@@ -1,74 +1,84 @@
-import math
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
+import math
 
-def make_additive_mask(attention_mask: torch.Tensor, dtype: torch.dtype):
+class SoftmaxAttention(nn.Module):
     """
-    attention_mask: [B,T] 1=valid, 0=pad
-    return: [B,1,1,T] additive mask (0 or -1e4)
+    标准的 Softmax Attention (Teacher 用)
+    Score = Softmax(QK^T / sqrt(d))
     """
-    neg = torch.tensor(-1e4, device=attention_mask.device, dtype=dtype)
-    return (1.0 - attention_mask.to(dtype))[:, None, None, :] * neg
-
-class AttnSoftmax(nn.Module):
-    def __init__(self, head_dim: int, dropout=0.0):
+    def __init__(self, head_dim, dropout=0.1):
         super().__init__()
-        self.scale = 1.0 / math.sqrt(head_dim)
-        self.drop = nn.Dropout(dropout)
+        self.head_dim = head_dim
+        self.dropout = nn.Dropout(dropout)
+        self.softmax = nn.Softmax(dim=-1)
 
-    def forward(self, q, k, v, attention_mask=None):
-        # q,k,v: [B,H,T,D]
-        scores = (q @ k.transpose(-2, -1)) * self.scale  # [B,H,T,T]
+    def forward(self, q, k, v, attention_mask=None, tau=None):
+        # q, k, v: [B, H, L, D]
+        
+        # 1. Scaled Dot-Product
+        scores = torch.matmul(q, k.transpose(-1, -2)) / math.sqrt(self.head_dim)
+        
+        # 2. Masking (Additive Mask for Softmax)
         if attention_mask is not None:
-            scores = scores + make_additive_mask(attention_mask, scores.dtype)
-        p = F.softmax(scores, dim=-1)
-        p = self.drop(p)
-        out = p @ v
-        return out, p
+            # attention_mask usually is 1 for valid, 0 for pad
+            # We want to add -inf to pad positions
+            # mask shape: [B, L] -> [B, 1, 1, L]
+            mask_expanded = attention_mask.unsqueeze(1).unsqueeze(2)
+            scores = scores.masked_fill(mask_expanded == 0, -1e9)
+
+        # 3. Softmax
+        attn_probs = self.softmax(scores)
+        attn_probs = self.dropout(attn_probs)
+        
+        # 4. Output
+        out = torch.matmul(attn_probs, v)
+        return out, attn_probs
+
 
 class Attn2Quad(nn.Module):
     """
-    2Quad: (x+c)^2 / sum (x+c)^2
+    FHE 友好的 2-Quad Attention (Student 用)
+    Score = ((QK^T + c)^2 * static_scale) / tau
     """
-    def __init__(self, head_dim: int, c=3.0, eps=1e-6, dropout=0.0):
+    def __init__(self, head_dim, dropout=0.1, c=4.0, eps=1e-6):
         super().__init__()
-        self.scale = 1.0 / math.sqrt(head_dim)
-        self.c = float(c)
-        self.eps = float(eps)
-        self.drop = nn.Dropout(dropout)
+        self.c = c
+        self.eps = eps
+        self.dropout = nn.Dropout(dropout)
+        
+        # [关键保留] 静态缩放因子，防止数值爆炸
+        # 这个值在导出 FHE 权重时会被融合
+        self.static_scale = 0.01 
 
-    def forward(self, q, k, v, attention_mask=None):
-        scores = (q @ k.transpose(-2, -1)) * self.scale
+    def forward(self, q, k, v, attention_mask=None, tau=None):
+        # q, k: [B, H, L, D]
+        
+        # 1. 计算原始分数 QK^T
+        attn_scores = torch.matmul(q, k.transpose(-1, -2))
+        
+        # 2. 应用 2Quad: (x + c)^2 -> 值域约 [16, 100+]
+        attn_scores = (attn_scores + self.c).pow(2)
+        
+        # 3. 静态缩放 (把数值拉回正常范围)
+        attn_scores = attn_scores * self.static_scale
+        
+        # 4. 动态微调 (Learnable Tau)
+        if tau is not None:
+            # view for broadcasting: [B, H, L, L] / [H] -> [1, H, 1, 1]
+            attn_scores = attn_scores / tau.view(1, -1, 1, 1)
+
+        # 5. Masking (Multiplicative Mask for Polynomial)
         if attention_mask is not None:
-            scores = scores + make_additive_mask(attention_mask, scores.dtype)
+            # mask: 1 keep, 0 remove. 直接乘即可
+            attn_scores = attn_scores * attention_mask.unsqueeze(1).unsqueeze(2)
 
-        x = scores + self.c
-        num = x * x               # 一次平方（方案一）
-        den = num.sum(dim=-1, keepdim=True) + self.eps
-        p = num / den
-        p = self.drop(p)
-        out = p @ v
-        return out, p
+        # 6. Output
+        out = torch.matmul(attn_scores, v)
+        out = self.dropout(out)
+        # attn_scores: [B,H,L,L]
+        print("PT head0 row0 sum:", attn_scores[0,0,0,:].sum().item())
+        print("PT head1 row0 sum:", attn_scores[0,1,0,:].sum().item())
+        print("PT head0/1 row0 max:", attn_scores[0,0,0,:].max().item(), attn_scores[0,1,0,:].max().item())
 
-class AttnPowerP2(nn.Module):
-    """
-    PowerSoftmax p=2: x^2 / sum x^2
-    """
-    def __init__(self, head_dim: int, eps=1e-6, dropout=0.0):
-        super().__init__()
-        self.scale = 1.0 / math.sqrt(head_dim)
-        self.eps = float(eps)
-        self.drop = nn.Dropout(dropout)
-
-    def forward(self, q, k, v, attention_mask=None):
-        scores = (q @ k.transpose(-2, -1)) * self.scale
-        if attention_mask is not None:
-            scores = scores + make_additive_mask(attention_mask, scores.dtype)
-
-        num = scores * scores      # 一次平方（方案一）
-        den = num.sum(dim=-1, keepdim=True) + self.eps
-        p = num / den
-        p = self.drop(p)
-        out = p @ v
-        return out, p
+        return out, attn_scores

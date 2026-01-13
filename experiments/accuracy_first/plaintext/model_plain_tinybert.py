@@ -1,132 +1,173 @@
 import torch
 import torch.nn as nn
 
-from .attention_plain import Attn2Quad, AttnPowerP2, AttnSoftmax
-from .activations_plain import GeLUPoly2Learnable, GeLUPoly2Fixed
+# 引入底层的数学实现
+from .attention_plain import Attn2Quad, SoftmaxAttention
+
+class BiasLayer(nn.Module):
+    """
+    FHE 深度优化层：只做加法，不消耗 Level。
+    y = x + bias
+    """
+    def __init__(self, hidden_size):
+        super().__init__()
+        self.bias = nn.Parameter(torch.zeros(hidden_size))
+
+    def forward(self, x):
+        return x + self.bias
 
 class PlainSelfAttention(nn.Module):
-    def __init__(self, hidden, heads, dropout, attn_type="2quad", attn_kwargs=None):
+    """
+    封装了 Q, K, V 投影层的 Attention 模块
+    """
+    def __init__(self, hidden, heads, dropout, attn_type="2quad", attn_kwargs=None, learnable_tau=True):
         super().__init__()
         assert hidden % heads == 0
         self.hidden = hidden
         self.heads = heads
-        self.d = hidden // heads
+        self.head_dim = hidden // heads
         attn_kwargs = attn_kwargs or {}
 
-        # 关键：这些名字你后面要尽量对齐 FHE TinyBERT 的命名
+        # Q, K, V, Output 投影层 (FHE 优化: bias=False)
         self.qkv = nn.Linear(hidden, 3 * hidden, bias=False)
         self.wo  = nn.Linear(hidden, hidden, bias=False)
         self.drop = nn.Dropout(dropout)
 
-        if attn_type == "softmax":
-            self.attn = AttnSoftmax(self.d, dropout=dropout)
-        elif attn_type == "2quad":
-            self.attn = Attn2Quad(self.d, dropout=dropout, **attn_kwargs)
-        elif attn_type == "p2":
-            self.attn = AttnPowerP2(self.d, dropout=dropout, **attn_kwargs)
+        # Tau 参数
+        if learnable_tau:
+            # 配合 static_scale=0.01，初始 tau=5.0 使得总缩放 ~1.0
+            self.tau = nn.Parameter(torch.full((heads,), 5.0))
         else:
-            raise ValueError(attn_type)
+            self.register_buffer("tau", torch.full((heads,), 5.0))
 
-    def forward(self, x, attention_mask=None):
+        # 实例化具体的数学计算核心
+        if attn_type == "softmax":
+            # Softmax 不需要 head_dim 做参数(内部用)，也不需要 c
+            self.attn = SoftmaxAttention(self.head_dim, dropout=dropout)
+        elif attn_type == "2quad":
+            # [Fix] 这里正确传递参数
+            # head_dim 是位置参数，其他通过 kwargs 传递 (包含 c)
+            self.attn = Attn2Quad(self.head_dim, dropout=dropout, **attn_kwargs)
+        else:
+            raise ValueError(f"Unknown attn_type: {attn_type}")
+
+    def forward(self, x, mask=None):
         B, T, C = x.shape
-        qkv = self.qkv(x)  # [B,T,3C]
+        # 1. 投影
+        qkv = self.qkv(x)
         q, k, v = qkv.chunk(3, dim=-1)
 
-        q = q.view(B, T, self.heads, self.d).transpose(1, 2)
-        k = k.view(B, T, self.heads, self.d).transpose(1, 2)
-        v = v.view(B, T, self.heads, self.d).transpose(1, 2)
+        # 2. Reshape heads
+        q = q.view(B, T, self.heads, self.head_dim).transpose(1, 2)
+        k = k.view(B, T, self.heads, self.head_dim).transpose(1, 2)
+        v = v.view(B, T, self.heads, self.head_dim).transpose(1, 2)
 
-        out, attn_prob = self.attn(q, k, v, attention_mask=attention_mask)
+        # 3. 计算 Attention (传入 tau)
+        # 注意：Attn2Quad.forward 签名需要支持 tau
+        out, _ = self.attn(q, k, v, attention_mask=mask, tau=self.tau)
+
+        # 4. 还原形状 & 输出投影
         out = out.transpose(1, 2).contiguous().view(B, T, C)
         out = self.wo(out)
         out = self.drop(out)
-        return out, attn_prob
+        return out
 
-
-class PlainFFN(nn.Module):
-    def __init__(self, hidden, intermediate, dropout, act="gelu_poly_learnable", act_kwargs=None):
+class TransformerBlock(nn.Module):
+    def __init__(self, hidden, heads, intermediate, dropout, attn_type, attn_kwargs, act, act_kwargs, norm_type="bias_only", learnable_tau=True):
         super().__init__()
-        act_kwargs = act_kwargs or {}
-        self.fc1 = nn.Linear(hidden, intermediate)
-        self.fc2 = nn.Linear(intermediate, hidden)
-        self.drop = nn.Dropout(dropout)
+        
+        # 1. Self Attention (使用封装好的类)
+        self.attention = PlainSelfAttention(
+            hidden, heads, dropout, 
+            attn_type=attn_type, 
+            attn_kwargs=attn_kwargs,
+            learnable_tau=learnable_tau
+        )
+        
+        # 2. FFN
+        from .activations_plain import get_activation
+        self.linear1 = nn.Linear(hidden, intermediate)
+        self.activation = get_activation(act, **act_kwargs)
+        self.linear2 = nn.Linear(intermediate, hidden)
+        self.dropout = nn.Dropout(dropout)
 
-        if act == "gelu_poly_learnable":
-            self.act = GeLUPoly2Learnable(**act_kwargs)
-        elif act == "gelu_poly_fixed":
-            self.act = GeLUPoly2Fixed(**act_kwargs)
-        elif act == "gelu":
-            self.act = nn.GELU()
+        # 3. Norm Strategy
+        self.norm_type = norm_type
+        if norm_type == "bn":
+            self.norm1 = nn.BatchNorm1d(hidden)
+            self.norm2 = nn.BatchNorm1d(hidden)
+        elif norm_type == "bias_only":
+            self.norm1 = BiasLayer(hidden)
+            self.norm2 = BiasLayer(hidden)
         else:
-            raise ValueError(act)
+            self.norm1 = nn.Identity()
+            self.norm2 = nn.Identity()
 
-    def forward(self, x):
-        x = self.fc1(x)
-        x = self.act(x)   # 二次时只多一个平方
-        x = self.drop(x)
-        x = self.fc2(x)
-        x = self.drop(x)
+    def forward(self, x, mask):
+        # Attention Sub-layer
+        residual = x
+        out = self.attention(x, mask)
+        x = residual + 0.2*out
+        
+        if self.norm_type == "bn":
+            x = x.transpose(1, 2)
+            x = self.norm1(x)
+            x = x.transpose(1, 2)
+        else:
+            x = self.norm1(x)
+
+        # FFN Sub-layer
+        residual = x
+        out = self.linear1(x)
+        out = self.activation(out)
+        out = self.linear2(out)
+        out = self.dropout(out)
+        x = residual + out
+        
+        if self.norm_type == "bn":
+            x = x.transpose(1, 2)
+            x = self.norm2(x)
+            x = x.transpose(1, 2)
+        else:
+            x = self.norm2(x)
+            
         return x
 
-
-class PlainEncoderLayer(nn.Module):
-    def __init__(self, hidden, heads, intermediate, dropout,
-                 attn_type="2quad", attn_kwargs=None,
-                 act="gelu_poly_learnable", act_kwargs=None):
-        super().__init__()
-        self.ln1 = nn.LayerNorm(hidden)
-        self.ln2 = nn.LayerNorm(hidden)
-        self.attn = PlainSelfAttention(hidden, heads, dropout, attn_type, attn_kwargs)
-        self.ffn = PlainFFN(hidden, intermediate, dropout, act, act_kwargs)
-
-    def forward(self, x, attention_mask=None):
-        h = self.ln1(x)
-        attn_out, attn_prob = self.attn(h, attention_mask=attention_mask)
-        x = x + attn_out
-
-        h2 = self.ln2(x)
-        ffn_out = self.ffn(h2)
-        x = x + ffn_out
-        return x, attn_prob, h2
-
-
 class PlainTinyBert(nn.Module):
-    """
-    明文 TinyBERT：只要你把 hidden/layers/heads/intermediate/vocab/max_len 对齐到 FHE 版本，
-    导出的权重就能复用（或少量 key 映射后复用）。
-    """
-    def __init__(self, vocab_size, max_len,
-                 hidden=128, layers=2, heads=2, intermediate=512,
-                 dropout=0.1,
-                 attn_type="2quad", attn_kwargs=None,
-                 act="gelu_poly_learnable", act_kwargs=None,
-                 num_classes=2):
+    def __init__(self, vocab_size, max_len, hidden, layers, heads, intermediate, dropout, 
+                 attn_type, attn_kwargs, act, act_kwargs, 
+                 norm_type="bias_only", learnable_tau=True, num_classes=2, **kwargs):
         super().__init__()
-        self.emb = nn.Embedding(vocab_size, hidden)
-        self.pos = nn.Embedding(max_len, hidden)
-        self.drop = nn.Dropout(dropout)
+        
+        self.embedding = nn.Embedding(vocab_size, hidden)
+        self.pos_embedding = nn.Parameter(torch.randn(1, max_len, hidden))
+        
+        # Embedding Norm
+        if norm_type == "bn":
+            self.emb_norm = nn.LayerNorm(hidden) 
+        else:
+            self.emb_norm = nn.Identity()
 
         self.layers = nn.ModuleList([
-            PlainEncoderLayer(hidden, heads, intermediate, dropout,
-                              attn_type, attn_kwargs, act, act_kwargs)
+            TransformerBlock(
+                hidden, heads, intermediate, dropout, 
+                attn_type, attn_kwargs, act, act_kwargs, 
+                norm_type, learnable_tau
+            )
             for _ in range(layers)
         ])
-
-        # 任务 head：如果你做的是分类，就用这个
-        self.cls = nn.Linear(hidden, num_classes)
+        
+        self.classifier = nn.Linear(hidden, num_classes)
 
     def forward(self, input_ids, attention_mask=None):
         B, T = input_ids.shape
         pos = torch.arange(T, device=input_ids.device).unsqueeze(0).expand(B, T)
+        
+        x = self.embedding(input_ids) + self.pos_embedding[:, :T, :]
+        x = self.emb_norm(x)
 
-        x = self.emb(input_ids) + self.pos(pos)
-        x = self.drop(x)
-
-        attn_probs, hiddens = [], []
         for layer in self.layers:
-            x, ap, h2 = layer(x, attention_mask=attention_mask)
-            attn_probs.append(ap)
-            hiddens.append(h2)
-
-        logits = self.cls(x[:, 0, :])  # [CLS]
-        return {"logits": logits, "attn_probs": attn_probs, "hiddens": hiddens}
+            x = layer(x, attention_mask)
+        
+        logits = self.classifier(x[:, 0, :])
+        return {"logits": logits}

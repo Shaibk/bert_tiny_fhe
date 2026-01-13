@@ -1,181 +1,159 @@
-import numpy as np
-import torch
 import gc
-
-from .block_matrix import BlockMatrix
-from .ops import approx_gelu
-
+import torch
+import numpy as np
+from src.block_matrix import BlockMatrix
 
 class FHEBertTinyEncoder:
     """
-    FHE 推理用 Tiny-BERT Encoder（单层 forward）
-    - 支持从 .npz 加载明文训练导出的权重（Wq/Wk/Wv/Wo/FF1/FF2）
-    - 若不提供 weights_path，则回退为随机初始化（用于benchmark/调试）
+    FHE Tiny-BERT Encoder (8-Level Optimized)
+    - Dynamic weight encoding (streamed) to avoid OOM
     """
 
-    def __init__(
-        self,
-        engine,
-        mult_key,
-        hadamard_key,
-        level=None,
-        ffn_w1_delta=5,
-        ffn_w2_delta=7,
-        weights_path=None,
-    ):
+    def __init__(self, engine, mult_key, hadamard_key, transposition_key, weights_path=None, layer_idx=0):
         self.engine = engine
         self.mult_key = mult_key
         self.hadamard_key = hadamard_key
-
+        self.transposition_key = transposition_key
+        self.layer_idx = layer_idx
         self.hidden_size = 128
-        self.ffn_size = 512
 
-        # 初始 encode level（None 表示用库默认 max）
-        self.level = level
-
-        # 你测出来的“从 init level 到 FFN 两次 matmul 前激活的 level 下降量”
-        # 默认按你现在的实验：W1 用 level-5，W2 用 level-7
-        self.ffn_w1_delta = ffn_w1_delta
-        self.ffn_w2_delta = ffn_w2_delta
-
-        # ===== 初始化权重（随机 or 从文件加载）=====
-        if weights_path is None:
-            self._init_random_weights_cpu()
+        if weights_path:
+            self._load_weights(weights_path)
         else:
-            self._load_weights_cpu(weights_path)
+            raise ValueError("Weights path required.")
 
-    # -------------------------
-    # Weight init / load
-    # -------------------------
-    def _init_random_weights_cpu(self):
-        print("   [Init] Generating Random Weights on CPU...")
-        self.np_wq = np.random.randn(self.hidden_size, self.hidden_size).astype(np.float32)
-        self.np_wk = np.random.randn(self.hidden_size, self.hidden_size).astype(np.float32)
-        self.np_wv = np.random.randn(self.hidden_size, self.hidden_size).astype(np.float32)
-        self.np_wo = np.random.randn(self.hidden_size, self.hidden_size).astype(np.float32)
-        self.np_ff1 = np.random.randn(self.hidden_size, self.ffn_size).astype(np.float32)
-        self.np_ff2 = np.random.randn(self.ffn_size, self.hidden_size).astype(np.float32)
-
-    def _load_weights_cpu(self, path: str):
-        """
-        从 tools/export_plain_weights_to_fhe_npz.py 导出的 .npz 读取权重。
-        期望包含 key：
-          np_wq, np_wk, np_wv, np_wo, np_ff1, np_ff2
-        并且形状分别为：
-          (H,H), (H,H), (H,H), (H,H), (H,FF), (FF,H)
-        """
-        print(f"   [Init] Loading weights from: {path}")
+    def _load_weights(self, path):
+        print(f"   [Init] Loading fused weights from: {path}")
         data = np.load(path)
+        p = f"encoder.layer.{self.layer_idx}"
 
-        self.np_wq = data["np_wq"].astype(np.float32)
-        self.np_wk = data["np_wk"].astype(np.float32)
-        self.np_wv = data["np_wv"].astype(np.float32)
-        self.np_wo = data["np_wo"].astype(np.float32)
-        self.np_ff1 = data["np_ff1"].astype(np.float32)
-        self.np_ff2 = data["np_ff2"].astype(np.float32)
+        def ld_vec(k):
+            return data[f"{p}.{k}"].astype(np.float32)
 
-        # 形状检查，避免 silent mismatch
-        assert self.np_wq.shape == (self.hidden_size, self.hidden_size), f"np_wq shape {self.np_wq.shape}"
-        assert self.np_wk.shape == (self.hidden_size, self.hidden_size), f"np_wk shape {self.np_wk.shape}"
-        assert self.np_wv.shape == (self.hidden_size, self.hidden_size), f"np_wv shape {self.np_wv.shape}"
-        assert self.np_wo.shape == (self.hidden_size, self.hidden_size), f"np_wo shape {self.np_wo.shape}"
-        assert self.np_ff1.shape == (self.hidden_size, self.ffn_size), f"np_ff1 shape {self.np_ff1.shape}"
-        assert self.np_ff2.shape == (self.ffn_size, self.hidden_size), f"np_ff2 shape {self.np_ff2.shape}"
+        def ld_w(k):
+            w = data[f"{p}.{k}"].astype(np.float32)
+            if w.ndim == 2:
+                return w.T                    # [out,in] -> [in,out]
+            elif w.ndim == 3:
+                return np.transpose(w, (0, 2, 1))  # [h,out,in] -> [h,in,out]
+            else:
+                raise ValueError(f"Unexpected weight ndim for {p}.{k}: {w.ndim}")
 
-        print("   [Init] Weights loaded OK.")
-        print(f"     np_wq: {self.np_wq.shape}  np_wk: {self.np_wk.shape}  np_wv: {self.np_wv.shape}")
-        print(f"     np_wo: {self.np_wo.shape}  np_ff1: {self.np_ff1.shape}  np_ff2: {self.np_ff2.shape}")
+        self.np_wq = ld_w("attention.self.query.weight")
+        self.np_wk = ld_w("attention.self.key.weight")
+        self.np_wv_fused = ld_w("attention.self.value_fused.weight")
 
-    # -------------------------
-    # Forward (single layer)
-    # -------------------------
-    def forward_one_layer(self, x_enc: BlockMatrix):
-        # --- Q ---
-        print("     > [1/6] Encoding W_Q & Computing Q...")
-        w_q_pt = BlockMatrix.encode_weights(self.engine, self.np_wq, level=self.level)
-        q = x_enc.matmul(w_q_pt, self.mult_key)
-        del w_q_pt
+        self.np_norm1_bias = ld_vec("attention.output.norm.bias")
+
+        self.np_ff1 = ld_w("intermediate.dense.weight")
+        self.np_ff2_quad = ld_w("output.dense.weight_quad")
+        self.np_ff2_lin  = ld_w("output.dense.weight_lin")
+        self.np_ff2_bias = ld_vec("output.dense.bias_fused")
+        self.np_norm2_bias = ld_vec("output.norm.bias")
+
+        print(f"   [DEBUG] np_wq shape: {self.np_wq.shape}, ndim={self.np_wq.ndim}")
+        print(f"   [DEBUG] np_wk shape: {self.np_wk.shape}, ndim={self.np_wk.ndim}")
+        print(f"   [DEBUG] np_wv_fused shape: {self.np_wv_fused.shape}, ndim={self.np_wv_fused.ndim}")
+
+    def _add_bias(self, x: BlockMatrix, bias_vec):
+        bias_full = np.tile(bias_vec, (x.rows, 1)).astype(np.float32)
+        # bias 体积小，encode_weights 可以接受；如果你也想更省，可改成分块 encode（但通常没必要）
+        w_bias = BlockMatrix.encode_weights(self.engine, bias_full, level=x.get_level())
+        res = x.add(w_bias)
+        del w_bias
+        return res
+
+    def forward_one_layer(self, x_enc: BlockMatrix, attention_mask=None):
+        current_level = x_enc.get_level()
+        print(f"   [FHE] Input Level: {current_level}")
+
+        # ==========================
+        # Part 1: Attention
+        # ==========================
+
+        # ✅ Q = X @ Wq（流式编码，不生成整张 w_q BlockMatrix）
+        q = x_enc.matmul_np_stream(self.np_wq, self.mult_key, level=current_level)
         torch.cuda.empty_cache()
 
-        # --- K ---
-        print("     > [2/6] Encoding W_K & Computing K...")
-        w_k_pt = BlockMatrix.encode_weights(self.engine, self.np_wk, level=self.level)
-        k = x_enc.matmul(w_k_pt, self.mult_key)
-        del w_k_pt
+        # ✅ K = X @ Wk（流式编码）
+        k = x_enc.matmul_np_stream(self.np_wk, self.mult_key, level=current_level)
         torch.cuda.empty_cache()
 
-        # --- Score ---
-        print("     > [3/6] Computing Attention Score (Q * K)...")
-        score = q.matmul(k, self.mult_key)
-        del q, k
+        # K^T
+        k_t = k.transpose(self.transposition_key)
+        del k
         torch.cuda.empty_cache()
-        gc.collect()
 
-        # --- Softmax approx ---
-        # 方案一：用平方替代 Softmax（当前实现等价于 p=2 / 2Quad(无常数c,无归一化) 的核心）
-        print("     > [Softmax] Approx with Square...")
-        attn_probs = score.square(self.hadamard_key)
+        # Score = Q @ K.T
+        score = q.matmul(k_t, self.mult_key)
+        del q, k_t
+        torch.cuda.empty_cache()
+
+        # Shift (+4)
+        print("     > [Attention] Shift Score (+4.0)...")
+        score_shifted = score.add_scalar(4.0)
         del score
+
+        # Square
+        print("     > [Attention] Square...")
+        probs = score_shifted.square(self.hadamard_key)
+        del score_shifted
         torch.cuda.empty_cache()
 
-        # --- V ---
-        print("     > [4/6] Encoding W_V & Computing V...")
-        w_v_pt = BlockMatrix.encode_weights(self.engine, self.np_wv, level=self.level)
-        v = x_enc.matmul(w_v_pt, self.mult_key)
-        del w_v_pt
+        # Mask (key-mask only)
+        if attention_mask is not None:
+            print("     > [Attention] Applying Mask...")
+            probs = probs.mul_plain(attention_mask)
+
+        # ✅ V_projected = X @ Wv_fused（流式编码）
+        v_projected = x_enc.matmul_np_stream(self.np_wv_fused, self.mult_key, level=current_level)
         torch.cuda.empty_cache()
 
-        # --- Context ---
-        print("     > [5/6] Computing Context (Probs * V)...")
-        context = attn_probs.matmul(v, self.mult_key)
-        del attn_probs, v
-        torch.cuda.empty_cache()
-
-        # --- Output proj ---
-        print("     > [6/6] Output Projection...")
-        w_o_pt = BlockMatrix.encode_weights(self.engine, self.np_wo, level=self.level)
-        output = context.matmul(w_o_pt, self.mult_key)
-        del w_o_pt
+        # Context
+        output = probs.matmul(v_projected, self.mult_key)
+        del probs, v_projected
         torch.cuda.empty_cache()
 
         # Residual
-        attention_out = x_enc.add(output)
-        del output
+        res1 = x_enc.add(output)
+
+        # Norm1 bias-only
+        print(f"     > [Norm1] Bias Addition (Level {res1.get_level()})...")
+        norm1 = self._add_bias(res1, self.np_norm1_bias)
+        del res1
         torch.cuda.empty_cache()
 
-        # ===== FFN with level-aware weight encoding =====
-        if self.level is None:
-            # 没有指定初始 level 时，无法按 “level-Δ” 推导，退回默认
-            level_w1 = None
-            level_w2 = None
-        else:
-            level_w1 = max(1, self.level - self.ffn_w1_delta)
-            level_w2 = max(1, self.level - self.ffn_w2_delta)
+        # ==========================
+        # Part 2: FFN
+        # ==========================
 
-        print(f"     > [FFN] Linear 1 (encode level={level_w1})...")
-        w_ff1_pt = BlockMatrix.encode_weights(self.engine, self.np_ff1, level=level_w1)
-        ff1 = attention_out.matmul(w_ff1_pt, self.mult_key)
-        try:
-            print("[Check] W1 pt.level =", w_ff1_pt.blocks[0][0].level)
-        except Exception:
-            pass
-        del w_ff1_pt
+        print("     > [FFN] Linear 1...")
+        ff1 = norm1.matmul_np_stream(self.np_ff1, self.mult_key, level=norm1.get_level())
         torch.cuda.empty_cache()
 
-        print("     > [FFN] GELU...")
-        ff_gelu = approx_gelu(ff1, self.hadamard_key)
+        print("     > [FFN] Split-Path PolyGELU...")
+
+        ff1_sq = ff1.square(self.hadamard_key)
+
+        term_quad = ff1_sq.matmul_np_stream(self.np_ff2_quad, self.mult_key, level=ff1_sq.get_level())
+        del ff1_sq
+        torch.cuda.empty_cache()
+
+        term_lin = ff1.matmul_np_stream(self.np_ff2_lin, self.mult_key, level=ff1.get_level())
         del ff1
         torch.cuda.empty_cache()
 
-        print(f"     > [FFN] Linear 2 (encode level={level_w2})...")
-        w_ff2_pt = BlockMatrix.encode_weights(self.engine, self.np_ff2, level=level_w2)
-        ff2 = ff_gelu.matmul(w_ff2_pt, self.mult_key)
-        try:
-            print("[Check] W2 pt.level =", w_ff2_pt.blocks[0][0].level)
-        except Exception:
-            pass
-        del w_ff2_pt, ff_gelu
-        torch.cuda.empty_cache()
+        ff2 = term_quad.add(term_lin)
+        del term_quad, term_lin
 
-        final_out = attention_out.add(ff2)
+        ff2 = self._add_bias(ff2, self.np_ff2_bias)
+
+        res2 = norm1.add(ff2)
+        del norm1, ff2
+
+        print("     > [Norm2] Bias Addition...")
+        final_out = self._add_bias(res2, self.np_norm2_bias)
+
+        gc.collect()
+        torch.cuda.empty_cache()
         return final_out
