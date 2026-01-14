@@ -1,4 +1,4 @@
-# inference.py
+import os
 import gc
 import torch
 import numpy as np
@@ -10,9 +10,16 @@ from src.block_matrix import BlockMatrix
 
 ID2LABEL = {9: "accept_reservations", 20: "freeze_account"}
 
+STATIC_SCALE = 0.01
+
+
+def build_keymask_tile(attn_1d: np.ndarray) -> np.ndarray:
+    L = attn_1d.shape[0]
+    return np.tile(attn_1d.reshape(1, -1), (L, 1)).astype(np.float32)  # [L,L]
+
 
 def main():
-    print("=== TinyBERT FHE Inference (Streamed Encoding, True Multi-Head) ===")
+    print("=== TinyBERT FHE Inference (Scheme B: scale in per-head mask; debug-ready) ===")
 
     text = "freeze my account"
     weights_path = "fhe_weights_8level_optimized.npz"
@@ -26,7 +33,7 @@ def main():
     total_len = int(attn_1d.shape[0])
     print(f"Text: '{text}' | Real Length: {real_len} / {total_len}")
 
-    # 仅用于构造 embedding 输入
+    # only for embeddings
     from experiments.accuracy_first.plaintext.model_plain_tinybert import PlainTinyBert
     pt_model = PlainTinyBert(
         vocab_size=30522, max_len=32, hidden=128, layers=2, heads=2, intermediate=512,
@@ -35,7 +42,8 @@ def main():
         act="gelu_poly_learnable", act_kwargs={"init_a": 0.02},
         norm_type="bias_only", learnable_tau=True, num_classes=150
     )
-    pt_model.load_state_dict(torch.load("experiments/accuracy_first/plaintext/student_8level.pt", map_location="cpu"))
+    # 注意：这里你按自己当前用的 ckpt 路径
+    pt_model.load_state_dict(torch.load("experiments/accuracy_first/plaintext/student_kd_plain.pt", map_location="cpu"))
     pt_model.eval()
 
     with torch.no_grad():
@@ -43,9 +51,24 @@ def main():
         x_emb = pt_model.emb_norm(x_emb)
         x_plain_np = x_emb.numpy().astype(np.float32)  # [1,32,128]
 
-    # key-mask only（对齐明文 Attn2Quad）
-    mask = np.tile(attn_1d.reshape(1, -1), (total_len, 1)).astype(np.float32)
-    print("[Mask] KEY-mask only (tile).")
+    # Load tau from npz and build per-head masks for each layer
+    w_data = np.load(weights_path)
+    tau0 = w_data["encoder.layer.0.attention.self.tau"].astype(np.float32)  # [2]
+    tau1 = w_data["encoder.layer.1.attention.self.tau"].astype(np.float32)  # [2]
+
+    keymask = build_keymask_tile(attn_1d)  # [L,L], values 0/1
+
+    # per-head scaled masks (Scheme B): mask_h = keymask * (0.01/tau_h)
+    mask0_l0 = keymask * (STATIC_SCALE / float(tau0[0]))
+    mask1_l0 = keymask * (STATIC_SCALE / float(tau0[1]))
+    mask0_l1 = keymask * (STATIC_SCALE / float(tau1[0]))
+    mask1_l1 = keymask * (STATIC_SCALE / float(tau1[1]))
+
+    print("[Mask] KEY-mask tile with per-head scale (0.01/tau).")
+    if os.getenv("FHE_DEBUG", "0") == "1":
+        print(f"   tau layer0: {tau0}, scale: {[STATIC_SCALE/float(tau0[0]), STATIC_SCALE/float(tau0[1])]}")
+        print(f"   tau layer1: {tau1}, scale: {[STATIC_SCALE/float(tau1[0]), STATIC_SCALE/float(tau1[1])]}")
+        print(f"   mask0_l0 nonzero value: {mask0_l0[0,0]:.6g}")
 
     # FHE init
     PHYSICAL = 256
@@ -58,39 +81,38 @@ def main():
         "trans": engine.create_transposition_key(sk),
     }
 
-    # 输入 tile 到所有 lanes（不要切输入）
+    # batch lanes: replicate same sample
     x_packed = np.tile(x_plain_np, (PHYSICAL, 1, 1))
     input_enc = BlockMatrix.encrypt_inputs(engine, x_packed, sk, block_size=64)
 
-    # 两层 encoder（内部会流式 encode 权重）
     bert_l0 = FHEBertTinyEncoder(engine, keys["mult"], keys["hadamard"], keys["trans"], weights_path, layer_idx=0)
     bert_l1 = FHEBertTinyEncoder(engine, keys["mult"], keys["hadamard"], keys["trans"], weights_path, layer_idx=1)
 
-    print("Running Layer 0 (with Mask)...")
-    out_l0 = bert_l0.forward_one_layer(input_enc, attention_mask=mask)
+    # Enable decrypt-based debug only if FHE_DEBUG=1
+    if os.getenv("FHE_DEBUG", "0") == "1":
+        bert_l0.debug_sk = sk
+        bert_l1.debug_sk = sk
+        bert_l0.debug_real_len = real_len
+        bert_l1.debug_real_len = real_len
 
-    print("Running Layer 1 (with Mask)...")
-    out_l1 = bert_l1.forward_one_layer(out_l0, attention_mask=mask)
+    print("Running Layer 0...")
+    out_l0 = bert_l0.forward_one_layer(input_enc, attention_mask=(mask0_l0, mask1_l0))
 
-    # 解密 + stitch：lane0 + lane128（代表 head0/head1）
-    print("Decrypting & Stitching (lane sum for heads)...")
+    print("Running Layer 1...")
+    out_l1 = bert_l1.forward_one_layer(out_l0, attention_mask=(mask0_l1, mask1_l1))
+
+    # decrypt CLS from lane0 only
+    print("Decrypting CLS (lane0)...")
     res_00 = engine.decrypt(out_l1.blocks[0][0], sk)
     res_01 = engine.decrypt(out_l1.blocks[0][1], sk)
 
-    lane_h0 = 0
-    lane_h1 = 128
+    lane = 0
+    cls_vec = np.concatenate([res_00[lane, 0, :], res_01[lane, 0, :]]).astype(np.float32)
 
-    cls_h0 = np.concatenate([res_00[lane_h0, 0, :], res_01[lane_h0, 0, :]]).astype(np.float32)
-    cls_h1 = np.concatenate([res_00[lane_h1, 0, :], res_01[lane_h1, 0, :]]).astype(np.float32)
-    cls_vec = (cls_h0 + cls_h1).astype(np.float32)
-
-    print(f"   CLS(head0 lane) first5: {cls_h0[:5]}")
-    print(f"   CLS(head1 lane) first5: {cls_h1[:5]}")
-    print(f"   CLS(sum)        first5: {cls_vec[:5]}")
+    print(f"   CLS first5: {cls_vec[:5]}")
     print(f"   CLS L2 norm: {float(np.linalg.norm(cls_vec)):.4f} | abs max: {float(np.max(np.abs(cls_vec))):.4f}")
 
     # classifier
-    w_data = np.load(weights_path)
     W = w_data["classifier.weight"]
     b = w_data["classifier.bias"]
 

@@ -17,13 +17,16 @@ def main():
     # 1. 使用对应的预训练模型 ID
     # prajjwal1/bert-tiny 结构正好是: Layers=2, Hidden=128, Heads=2
     model_id = "google/bert_uncased_L-2_H-128_A-2"
-    
+    print("A: start")
+    print("B: before tokenizer")
     tokenizer = AutoTokenizer.from_pretrained(model_id, use_fast=True)
     max_len = 32
     batch_size = 64
     epochs = 20  # 预训练模型收敛很快，20轮足够了
 
     # 2. 加载数据
+    print("C: after tokenizer")
+    print("D: before dataloader")
     train_loader, val_loader, num_classes = build_clinc150_dataloaders(
         tokenizer=tokenizer,
         max_len=max_len,
@@ -31,12 +34,14 @@ def main():
     )
 
     # 3. 加载预训练的 Teacher (God Mode)
+    print("E: after dataloader")
+    print("F: before model")
     print(f"Loading pre-trained weights from {model_id}...")
     teacher = AutoModelForSequenceClassification.from_pretrained(
         model_id,
         num_labels=num_classes
     ).to(device)
-
+    print("G: after model")
     # 4. 优化器 & 调度器
     opt = torch.optim.AdamW(teacher.parameters(), lr=5e-4, weight_decay=0.01)
     
