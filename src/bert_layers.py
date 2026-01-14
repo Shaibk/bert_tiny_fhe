@@ -87,14 +87,20 @@ class FHEBertTinyEncoder:
 
     def _parse_masks(self, attention_mask):
         """
-        Returns (mask0, mask1) both shaped [L,L] or (None,None)
+        Returns (mask0, mask1).
+
+        Supported:
+        - None
+        - mask: np.ndarray [L,L] or [B,L,L]  (shared for both heads)
+        - (mask0, mask1): tuple/list where each is [L,L] or [B,L,L]
         """
         if attention_mask is None:
             return None, None
-        if isinstance(attention_mask, tuple) or isinstance(attention_mask, list):
+        if isinstance(attention_mask, (tuple, list)):
             assert len(attention_mask) == 2, "per-head attention_mask must be (mask0, mask1)"
             return attention_mask[0], attention_mask[1]
         return attention_mask, attention_mask
+
 
     def _dbg_probs(self, probs0: BlockMatrix, probs1: BlockMatrix):
         if (not self.debug_enabled) or self._dbg_probs_done:

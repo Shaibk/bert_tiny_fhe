@@ -195,9 +195,27 @@ class BlockMatrix:
         return res
 
     def mul_plain(self, plain_mat_np):
-        """Cipher ⊙ Plain（逐元素乘）"""
-        if plain_mat_np.shape != (self.rows, self.cols):
-            raise ValueError(f"Mask shape {plain_mat_np.shape} mismatch matrix {(self.rows, self.cols)}")
+        """
+        Cipher ⊙ Plain（逐元素乘）
+        支持:
+        - plain_mat_np: [rows, cols]        (shared mask, old behavior)
+        - plain_mat_np: [B, rows, cols]     (per-lane mask, new behavior)
+        """
+        # Determine mask mode
+        if plain_mat_np.ndim == 2:
+            shared = True
+            if plain_mat_np.shape != (self.rows, self.cols):
+                raise ValueError(f"Mask shape {plain_mat_np.shape} mismatch matrix {(self.rows, self.cols)}")
+            B = int(self.engine.shape[0])
+        elif plain_mat_np.ndim == 3:
+            shared = False
+            B = int(plain_mat_np.shape[0])
+            if B != int(self.engine.shape[0]):
+                raise ValueError(f"Mask batch {B} mismatch engine batch {self.engine.shape[0]}")
+            if plain_mat_np.shape[1:] != (self.rows, self.cols):
+                raise ValueError(f"Mask shape {plain_mat_np.shape[1:]} mismatch matrix {(self.rows, self.cols)}")
+        else:
+            raise ValueError(f"mask ndim must be 2 or 3, got {plain_mat_np.ndim}")
 
         res = BlockMatrix(self.engine, self.rows, self.cols, self.block_size)
         current_level = self.get_level()
@@ -210,16 +228,28 @@ class BlockMatrix:
                 r0, r1 = r * self.block_size, (r + 1) * self.block_size
                 c0, c1 = c * self.block_size, (c + 1) * self.block_size
 
-                sub_mask = np.zeros((self.block_size, self.block_size), dtype=np.float32)
                 real_r = min(self.rows, r1) - r0
                 real_c = min(self.cols, c1) - c0
-                if real_r > 0 and real_c > 0:
-                    sub_mask[:real_r, :real_c] = plain_mat_np[r0:r0+real_r, c0:c0+real_c]
 
-                encoded_mask = self.engine.encode(sub_mask, level=current_level)
+                if shared:
+                    # [64,64] -> broadcast to [B,64,64]
+                    sub = np.zeros((self.block_size, self.block_size), dtype=np.float32)
+                    if real_r > 0 and real_c > 0:
+                        sub[:real_r, :real_c] = plain_mat_np[r0:r0+real_r, c0:c0+real_c]
+                    combined = np.zeros((B, self.block_size, self.block_size), dtype=np.float32)
+                    combined[:] = sub
+                else:
+                    # [B,rows,cols] -> [B,64,64]
+                    combined = np.zeros((B, self.block_size, self.block_size), dtype=np.float32)
+                    if real_r > 0 and real_c > 0:
+                        combined[:, :real_r, :real_c] = plain_mat_np[:, r0:r0+real_r, c0:c0+real_c]
+
+                encoded_mask = self.engine.encode(combined, level=current_level)
                 res.blocks[r][c] = self.engine.hadamard_multiply(self.blocks[r][c], encoded_mask)
 
         return res
+
+
 
     def square(self, hadamard_key):
         """平方（Hadamard 自乘）"""
