@@ -1,10 +1,13 @@
 import os
 import sys
+import argparse
 import torch
 import numpy as np
 
 sys.path.append(os.path.join(os.path.dirname(__file__), ".."))
 from experiments.accuracy_first.plaintext.model_plain_tinybert import PlainTinyBert
+from experiments.accuracy_first.plaintext.dataset_registry import add_dataset_args, normalize_dataset_name
+from experiments.accuracy_first.plaintext.artifact_utils import build_ckpt_path, build_weights_path
 
 # ================= 配置区 =================
 STATIC_SCALE = 0.01
@@ -19,19 +22,46 @@ GLOBAL_DAMPING = 1.0
 # =========================================
 
 
+def parse_args():
+    parser = argparse.ArgumentParser(description="Export FHE weights with dataset suffix.")
+    add_dataset_args(parser, default_dataset="clinc150")
+    parser.add_argument("--num-classes", type=int, default=None, help="Override num_classes if needed.")
+    return parser.parse_args()
+
+
 def main():
+    args = parse_args()
     project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-    model_path = os.path.join(project_root, "experiments/accuracy_first/plaintext/student_kd_plain.pt")
-    output_path = os.path.join(project_root, "fhe_weights_8level_optimized.npz")
+    dataset_name = normalize_dataset_name(args.dataset)
+    model_path = build_ckpt_path(
+        os.path.join(project_root, "experiments/accuracy_first/plaintext"),
+        dataset_name,
+        args.dataset_version,
+        "student_kd_plain",
+    )
+    output_path = build_weights_path(
+        project_root,
+        dataset_name,
+        args.dataset_version,
+        "fhe_weights_8level_optimized",
+    )
 
     print(f"Loading model from {model_path}...")
+
+    if args.num_classes is None:
+        if dataset_name == "clinc150":
+            num_classes = 150
+        else:
+            raise ValueError("num_classes is required for non-CLINC datasets.")
+    else:
+        num_classes = args.num_classes
 
     model = PlainTinyBert(
         vocab_size=30522, max_len=32, hidden=HIDDEN_SIZE, layers=LAYERS, heads=HEADS,
         intermediate=512, dropout=0.0,
         attn_type="2quad", attn_kwargs={"c": 4.0},
         act="gelu_poly_learnable", act_kwargs={"init_a": 0.02, "init_b": 0.5, "init_d": 0.5},
-        norm_type="bias_only", learnable_tau=True, num_classes=150
+        norm_type="bias_only", learnable_tau=True, num_classes=num_classes
     )
 
     if not os.path.exists(model_path):

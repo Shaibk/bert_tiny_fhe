@@ -5,55 +5,57 @@ from datasets import load_dataset, DownloadConfig
 
 
 def _guess_text_field(features):
-    for k in ["text", "utterance", "sentence"]:
+    for k in ["text", "comment_text", "sentence", "comment"]:
         if k in features:
             return k
     raise ValueError(f"Cannot find text field in {features.keys()}")
 
 
 def _guess_label_field(features):
-    for k in ["label", "intent", "labels"]:
+    for k in ["label", "labels", "toxic", "toxicity"]:
         if k in features:
             return k
     raise ValueError(f"Cannot find label field in {features.keys()}")
 
 
-def build_clinc150_dataloaders(
+def _normalize_label(value, toxic_threshold: float):
+    if isinstance(value, list):
+        return int(value[0])
+    if isinstance(value, (float, int)):
+        return int(float(value) >= toxic_threshold)
+    return int(value)
+
+
+def _build_jigsaw_dataset(
     tokenizer,
     max_len=32,
-    batch_size=128,
-    num_workers=4,
+    dataset_config=None,
+    dataset_source=None,
+    toxic_threshold=0.5,
 ):
-    """
-    CLINC150 in-domain intent classification only (OOS filtered out)
-
-    Returns:
-        train_loader, val_loader, num_classes
-    """
-
-    # ===== Load dataset =====
     os.environ.setdefault("HF_DATASETS_OFFLINE", "1")
     os.environ.setdefault("TRANSFORMERS_OFFLINE", "1")
+    source = dataset_source or "jigsaw_toxicity_pred"
     ds = load_dataset(
-        "DeepPavlov/clinc150",
+        source,
+        dataset_config,
         download_config=DownloadConfig(local_files_only=True),
     )
 
     text_field = _guess_text_field(ds["train"].features)
     label_field = _guess_label_field(ds["train"].features)
 
-    # ===== Filter out OOS samples (label == None) =====
-    def is_in_domain(example):
-        return example[label_field] is not None
+    def normalize_example(example):
+        example[label_field] = _normalize_label(example[label_field], toxic_threshold)
+        return example
 
-    ds["train"] = ds["train"].filter(is_in_domain)
-    ds["validation"] = ds["validation"].filter(is_in_domain)
+    for split in ["train", "validation", "test"]:
+        if split in ds:
+            ds[split] = ds[split].map(normalize_example)
 
-    # ===== Infer num_classes safely =====
     labels = ds["train"][label_field]
     num_classes = int(max(labels)) + 1
 
-    # ===== Tokenization =====
     def tokenize_fn(batch):
         enc = tokenizer(
             batch[text_field],
@@ -70,8 +72,26 @@ def build_clinc150_dataloaders(
         remove_columns=ds["train"].column_names,
     )
     ds.set_format(type="torch")
+    return ds, num_classes
 
-    # ===== DataLoaders =====
+
+def build_jigsaw_toxic_dataloaders(
+    tokenizer,
+    max_len=32,
+    batch_size=128,
+    num_workers=4,
+    dataset_config=None,
+    dataset_source=None,
+    toxic_threshold=0.5,
+):
+    ds, num_classes = _build_jigsaw_dataset(
+        tokenizer=tokenizer,
+        max_len=max_len,
+        dataset_config=dataset_config,
+        dataset_source=dataset_source,
+        toxic_threshold=toxic_threshold,
+    )
+
     train_loader = DataLoader(
         ds["train"],
         batch_size=batch_size,
@@ -79,7 +99,6 @@ def build_clinc150_dataloaders(
         num_workers=num_workers,
         pin_memory=True,
     )
-
     val_loader = DataLoader(
         ds["validation"],
         batch_size=batch_size,
@@ -91,58 +110,23 @@ def build_clinc150_dataloaders(
     return train_loader, val_loader, num_classes
 
 
-def build_clinc150_dataloaders_with_test(
+def build_jigsaw_toxic_dataloaders_with_test(
     tokenizer,
     max_len=32,
     batch_size=128,
     num_workers=4,
+    dataset_config=None,
+    dataset_source=None,
+    toxic_threshold=0.5,
 ):
-    """
-    Same as build_clinc150_dataloaders, but also returns test_loader.
-    """
-    # ===== Load dataset =====
-    os.environ.setdefault("HF_DATASETS_OFFLINE", "1")
-    os.environ.setdefault("TRANSFORMERS_OFFLINE", "1")
-    ds = load_dataset(
-        "DeepPavlov/clinc150",
-        download_config=DownloadConfig(local_files_only=True),
+    ds, num_classes = _build_jigsaw_dataset(
+        tokenizer=tokenizer,
+        max_len=max_len,
+        dataset_config=dataset_config,
+        dataset_source=dataset_source,
+        toxic_threshold=toxic_threshold,
     )
 
-    text_field = _guess_text_field(ds["train"].features)
-    label_field = _guess_label_field(ds["train"].features)
-
-    # ===== Filter out OOS samples (label == None) =====
-    def is_in_domain(example):
-        return example[label_field] is not None
-
-    ds["train"] = ds["train"].filter(is_in_domain)
-    ds["validation"] = ds["validation"].filter(is_in_domain)
-    if "test" in ds:
-        ds["test"] = ds["test"].filter(is_in_domain)
-
-    # ===== Infer num_classes safely =====
-    labels = ds["train"][label_field]
-    num_classes = int(max(labels)) + 1
-
-    # ===== Tokenization =====
-    def tokenize_fn(batch):
-        enc = tokenizer(
-            batch[text_field],
-            truncation=True,
-            padding="max_length",
-            max_length=max_len,
-        )
-        enc["labels"] = batch[label_field]
-        return enc
-
-    ds = ds.map(
-        tokenize_fn,
-        batched=True,
-        remove_columns=ds["train"].column_names,
-    )
-    ds.set_format(type="torch")
-
-    # ===== DataLoaders =====
     train_loader = DataLoader(
         ds["train"],
         batch_size=batch_size,
@@ -150,7 +134,6 @@ def build_clinc150_dataloaders_with_test(
         num_workers=num_workers,
         pin_memory=True,
     )
-
     val_loader = DataLoader(
         ds["validation"],
         batch_size=batch_size,

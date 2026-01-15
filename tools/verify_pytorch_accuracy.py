@@ -3,13 +3,19 @@ import numpy as np
 import os
 import sys
 from transformers import AutoTokenizer
+import argparse
 
 # Add project root to path
 sys.path.append(os.path.join(os.path.dirname(__file__), ".."))
 from experiments.accuracy_first.plaintext.model_plain_tinybert import PlainTinyBert
 
 # [新增] 引入数据加载器，这是“真理”的来源
-from experiments.accuracy_first.plaintext.data_clinc150 import build_clinc150_dataloaders
+from experiments.accuracy_first.plaintext.dataset_registry import (
+    add_dataset_args,
+    build_dataloaders,
+    normalize_dataset_name,
+)
+from experiments.accuracy_first.plaintext.artifact_utils import build_ckpt_path
 
 # The sentences we used in the benchmark
 TEST_SENTENCES = [
@@ -31,13 +37,20 @@ TEST_SENTENCES = [
     "what is my balance"              
 ]
 
-def get_real_label_map(tokenizer):
+def get_real_label_map(tokenizer, dataset_name, dataset_config=None, dataset_source=None):
     """
     通过初始化 DataLoader 来获取真实的 ID->Label 映射表
     """
     print("⏳ Loading dataset to extract REAL label mapping...")
     # 我们只需要 train_loader 来获取类别列表，batch_size 设为 1 即可
-    train_loader, _, _ = build_clinc150_dataloaders(tokenizer, max_len=32, batch_size=1)
+    train_loader, _, _ = build_dataloaders(
+        dataset_name,
+        tokenizer,
+        max_len=32,
+        batch_size=1,
+        dataset_config=dataset_config,
+        dataset_source=dataset_source,
+    )
     
     # 获取数据集对象
     dataset = train_loader.dataset
@@ -70,17 +83,30 @@ def get_real_label_map(tokenizer):
         
     return id2label
 
+def parse_args():
+    parser = argparse.ArgumentParser(description="PyTorch accuracy verification with label mapping.")
+    add_dataset_args(parser, default_dataset="clinc150")
+    return parser.parse_args()
+
+
 def main():
+    args = parse_args()
     print("==========================================================")
     print("   PyTorch Model Accuracy Verification (Real Labels)")
     print("==========================================================")
-    
+
     # 1. Load Tokenizer & Real Labels
     model_id = "google/bert_uncased_L-2_H-128_A-2"
     tokenizer = AutoTokenizer.from_pretrained(model_id)
     
     # [关键步骤] 获取真实的 ID 映射
-    ID2LABEL = get_real_label_map(tokenizer)
+    dataset_name = normalize_dataset_name(args.dataset)
+    ID2LABEL = get_real_label_map(
+        tokenizer,
+        dataset_name,
+        dataset_config=args.dataset_config,
+        dataset_source=args.dataset_source,
+    )
     
     if not ID2LABEL:
         print("❌ Failed to load label map. Using empty map.")
@@ -94,7 +120,12 @@ def main():
     # 2. Load Model
     project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     # 确保加载的是你最新的、训练好的正则化模型
-    model_path = os.path.join(project_root, "experiments/accuracy_first/plaintext/student_kd_plain.pt")
+    model_path = build_ckpt_path(
+        os.path.join(project_root, "experiments/accuracy_first/plaintext"),
+        dataset_name,
+        args.dataset_version,
+        "student_kd_plain",
+    )
     
     print(f"\nLoading Model: {model_path}")
     

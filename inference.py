@@ -1,5 +1,6 @@
 import os
 import gc
+import argparse
 import torch
 import numpy as np
 from transformers import AutoTokenizer
@@ -22,22 +23,46 @@ def build_keymask_tile(attn_1d: np.ndarray) -> np.ndarray:
     return np.tile(attn_1d.reshape(1, -1), (L, 1)).astype(np.float32)
 
 
+def parse_args():
+    parser = argparse.ArgumentParser(description="TinyBERT FHE inference.")
+    parser.add_argument(
+        "--texts",
+        nargs="+",
+        default=[
+            "freeze my account",
+            "can you accept reservations",
+            "freeze account now",
+            "i want to reserve a table",
+        ],
+    )
+    from experiments.accuracy_first.plaintext.dataset_registry import add_dataset_args
+    add_dataset_args(parser, default_dataset="clinc150")
+    return parser.parse_args()
+
+
 def main():
     print("=== TinyBERT FHE Inference (GL+Desilo | per-lane inputs & per-lane masks | Scheme B) ===")
+    args = parse_args()
+    from experiments.accuracy_first.plaintext.dataset_registry import normalize_dataset_name
+    from experiments.accuracy_first.plaintext.artifact_utils import build_ckpt_path, build_weights_path
 
     # --------
     # Inputs: multiple texts (<=256)
     # --------
-    texts = [
-        "freeze my account",
-        "can you accept reservations",
-        "freeze account now",
-        "i want to reserve a table",
-    ]
+    texts = args.texts
 
-    weights_path = "fhe_weights_8level_optimized.npz"
+    dataset_name = normalize_dataset_name(args.dataset)
+    if dataset_name != "clinc150":
+        ID2LABEL.clear()
 
     tokenizer = AutoTokenizer.from_pretrained("google/bert_uncased_L-2_H-128_A-2")
+    project_root = os.path.dirname(os.path.abspath(__file__))
+    weights_path = build_weights_path(
+        project_root,
+        dataset_name,
+        args.dataset_version,
+        "fhe_weights_8level_optimized",
+    )
 
     # --------
     # Plain model only for embeddings
@@ -50,7 +75,13 @@ def main():
         act="gelu_poly_learnable", act_kwargs={"init_a": 0.02},
         norm_type="bias_only", learnable_tau=True, num_classes=150
     )
-    pt_model.load_state_dict(torch.load("experiments/accuracy_first/plaintext/student_kd_plain.pt", map_location="cpu"))
+    ckpt_path = build_ckpt_path(
+        os.path.join(project_root, "experiments/accuracy_first/plaintext"),
+        dataset_name,
+        args.dataset_version,
+        "student_kd_plain",
+    )
+    pt_model.load_state_dict(torch.load(ckpt_path, map_location="cpu"))
     pt_model.eval()
 
     # --------

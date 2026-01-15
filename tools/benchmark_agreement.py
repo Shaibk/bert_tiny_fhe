@@ -1,185 +1,171 @@
-import torch
-import numpy as np
-import time
 import os
 import sys
+import numpy as np
+import torch
 from transformers import AutoTokenizer
 import desilofhe as fhe
+import argparse
 
-# 引入项目模块
 sys.path.append(os.path.join(os.path.dirname(__file__), ".."))
+
 from experiments.accuracy_first.plaintext.model_plain_tinybert import PlainTinyBert
+from experiments.accuracy_first.plaintext.dataset_registry import add_dataset_args, normalize_dataset_name
+from experiments.accuracy_first.plaintext.artifact_utils import build_ckpt_path, build_weights_path
 from src.bert_layers import FHEBertTinyEncoder
 from src.block_matrix import BlockMatrix
 
-# 模拟一些测试句子 (循环填充到 128 个)
+MODEL_ID = "google/bert_uncased_L-2_H-128_A-2"
+CKPT_PREFIX = "student_kd_plain"
+WEIGHTS_PREFIX = "fhe_weights_8level_optimized"
+
+MAX_LEN = 32
+HIDDEN = 128
+PHYSICAL = 256
+BLOCK = 64
+STATIC_SCALE = 0.01
+
 TEST_SENTENCES = [
-    "freeze my account", "tell me the weather", "what is your name", 
-    "book a table for two", "transfer money to mom", "how is the traffic",
-    "play some music", "set an alarm for 8am", "what is the date today",
-    "where is the nearest gas station", "cancel my reservation", "who are you",
-    "exchange rate for euro", "my card is lost", "do you like pizza",
-    "what is my balance"
+    "freeze my account",
+    "can you accept reservations",
+    "what is your name",
+    "transfer money to mom",
+    "book a table for two",
 ]
 
-def get_batch_data(batch_size=128):
-    """生成 128 个输入句子和对应的 Embedding"""
-    sentences = [TEST_SENTENCES[i % len(TEST_SENTENCES)] for i in range(batch_size)]
-    model_id = "google/bert_uncased_L-2_H-128_A-2"
-    tokenizer = AutoTokenizer.from_pretrained(model_id)
-    inputs = tokenizer(sentences, return_tensors="pt", padding="max_length", max_length=32, truncation=True)
-    return sentences, inputs
 
-def load_pytorch_model(device="cpu"):
-    project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-    model_path = os.path.join(project_root, "experiments/accuracy_first/plaintext/student_8level.pt")
-    
+def build_keymask_tile(attn_1d: np.ndarray) -> np.ndarray:
+    L = attn_1d.shape[0]
+    return np.tile(attn_1d.reshape(1, -1), (L, 1)).astype(np.float32)
+
+
+def load_plain_model(vocab_size: int, num_classes: int, device: str, ckpt_path: str):
     model = PlainTinyBert(
-        vocab_size=30522, max_len=32, hidden=128, layers=2, heads=2, 
-        intermediate=512, dropout=0.0, 
-        attn_type="2quad", attn_kwargs={"c": 4.0}, 
+        vocab_size=vocab_size, max_len=MAX_LEN, hidden=HIDDEN, layers=2, heads=2,
+        intermediate=512, dropout=0.0,
+        attn_type="2quad", attn_kwargs={"c": 4.0},
         act="gelu_poly_learnable", act_kwargs={"init_a": 0.02, "init_b": 0.5, "init_d": 0.5},
-        norm_type="bias_only", learnable_tau=True, num_classes=150
-    )
-    model.load_state_dict(torch.load(model_path, map_location=device))
+        norm_type="bias_only", learnable_tau=True, num_classes=num_classes,
+    ).to(device)
+    model.load_state_dict(torch.load(ckpt_path, map_location=device), strict=True)
     model.eval()
     return model
 
+
 def main():
-    print("==========================================================")
-    print("   PyTorch vs FHE: The Ultimate Agreement Test")
-    print("==========================================================")
-    
-    # 1. 准备数据
-    BATCH_SIZE = 128
-    print(f"1. Generating {BATCH_SIZE} inputs...")
-    sentences, inputs_pt = get_batch_data(BATCH_SIZE)
-    input_ids_pt = inputs_pt["input_ids"]
-    attention_mask_pt = inputs_pt["attention_mask"] # [关键] 获取 mask
-    
-    # 2. PyTorch 推理 (Ground Truth)
-    print("2. Running PyTorch Inference...")
-    TOTAL_DAMPING = 1e-6 # 模拟 FHE 阻尼效果
-    pt_model = load_pytorch_model()
-    with torch.no_grad():
-        # [关键修复] 传入 attention_mask，避免 PAD 干扰预测结果
-        pt_out = pt_model(input_ids_pt, attention_mask=attention_mask_pt)
-        pt_logits = pt_out["logits"].numpy() * TOTAL_DAMPING 
-        pt_preds = np.argmax(pt_logits, axis=1)
-    
-    print(f"   PyTorch completed. Predictions preview: {pt_preds[:10]}")
+    parser = argparse.ArgumentParser(description="Agreement check between plaintext and FHE.")
+    add_dataset_args(parser, default_dataset="clinc150")
+    args = parser.parse_args()
 
-    # 3. FHE 推理
-    print("\n3. Running FHE Inference (Full Batch)...")
-    
-    # FHE 配置
-    NUM_HEADS = 2
-    PHYSICAL_BATCH = BATCH_SIZE * NUM_HEADS 
-    weights_path = "fhe_weights_8level_damped.npz" # 用阻尼后的权重
-    
-    # 计算 Embedding (Client Side)
-    # [模拟] FHE 暂时无法高效处理 Mask，我们这里只验证数值计算的一致性。
-    # 为了保证对比公平，我们需要用 PyTorch 算出的无 Mask 干扰的中间 Embedding 作为输入？
-    # 不，FHE 推理目前没有 Mask 逻辑，所以它实际上跑的是 "无 Mask" 的版本。
-    # 为了让 PyTorch 和 FHE 对齐，我们有两种选择：
-    # A. 给 FHE 加上 Mask (很难)
-    # B. 让 PyTorch 也不用 Mask (简单，但预测结果可能全是 9)
-    # 
-    # 既然之前的测试显示不加 Mask 会导致全 9，而加上 Mask 后预测正常，
-    # 说明 PyTorch 模型本身没问题。
-    # 现在的目标是验证 "FHE 是否正确执行了计算"。
-    # 所以我们应该让 PyTorch *也不加 Mask*，看看 FHE 的结果是否和这个 "全 9" 的结果一致。
-    # 如果一致，说明 FHE 没算错，只是缺了 Mask 功能。
-    # 
-    # [决定] 这里我们暂时不给 PyTorch 加 Mask，以验证 FHE 的计算正确性 (Agreement)。
-    # 如果你想看 FHE 的真实预测能力，未来需要在 bert_layers.py 里实现 Mask。
-    
-    # 回退到无 Mask 推理以对齐 FHE 现状
-    with torch.no_grad():
-        # 这里故意不传 mask，模拟 FHE 目前的状态
-        pt_out_nomask = pt_model(input_ids_pt) 
-        pt_logits_nomask = pt_out_nomask["logits"].numpy() * TOTAL_DAMPING
-        pt_preds_nomask = np.argmax(pt_logits_nomask, axis=1)
-        
-    print(f"   PyTorch (No Mask) Preview: {pt_preds_nomask[:10]}")
+    os.environ.setdefault("HF_DATASETS_OFFLINE", "1")
+    os.environ.setdefault("TRANSFORMERS_OFFLINE", "1")
+
+    dataset_name = normalize_dataset_name(args.dataset)
+    project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    ckpt_path = build_ckpt_path(
+        os.path.join(project_root, "experiments/accuracy_first/plaintext"),
+        dataset_name,
+        args.dataset_version,
+        CKPT_PREFIX,
+    )
+    weights_path = build_weights_path(project_root, dataset_name, args.dataset_version, WEIGHTS_PREFIX)
+
+    device = "cpu"
+    print("=== Agreement Check: Plain vs FHE (5 samples) ===")
+    print("CKPT:", ckpt_path)
+    print("NPZ :", weights_path)
+
+    tokenizer = AutoTokenizer.from_pretrained(MODEL_ID, use_fast=True, local_files_only=True)
+
+    inputs = tokenizer(
+        TEST_SENTENCES,
+        return_tensors="pt",
+        padding="max_length",
+        max_length=MAX_LEN,
+        truncation=True,
+    )
+    input_ids = inputs["input_ids"].to(device)
+    attention_mask = inputs["attention_mask"].to(device)
+
+    w = np.load(weights_path)
+    tau_l0 = w["encoder.layer.0.attention.self.tau"].astype(np.float32)
+    tau_l1 = w["encoder.layer.1.attention.self.tau"].astype(np.float32)
+    W_cls = w["classifier.weight"].astype(np.float32)
+    b_cls = w["classifier.bias"].astype(np.float32)
+
+    pt_model = load_plain_model(len(tokenizer), W_cls.shape[0], device, ckpt_path)
 
     with torch.no_grad():
-        x_emb = pt_model.embedding(input_ids_pt) + pt_model.pos_embedding[:, :32, :]
-        x_emb = pt_model.emb_norm(x_emb) 
-        x_plain_np = x_emb.numpy().astype(np.float32) 
+        pt_logits = pt_model(input_ids, attention_mask=attention_mask)["logits"].cpu().numpy()
+        pt_pred = np.argmax(pt_logits, axis=1)
 
-    # 初始化 FHE
-    print("   Initializing Engine...")
-    engine = fhe.GLEngine(shape=(PHYSICAL_BATCH, 64, 64), mode='gpu')
+        x_emb = pt_model.embedding(input_ids) + pt_model.pos_embedding[:, :MAX_LEN, :]
+        x_emb = pt_model.emb_norm(x_emb)
+        x_plain = x_emb.cpu().numpy().astype(np.float32)
+
+    # pack to PHYSICAL lanes
+    B = x_plain.shape[0]
+    x_pack = np.zeros((PHYSICAL, MAX_LEN, HIDDEN), dtype=np.float32)
+    x_pack[:B] = x_plain
+
+    s00 = STATIC_SCALE / float(tau_l0[0])
+    s01 = STATIC_SCALE / float(tau_l0[1])
+    s10 = STATIC_SCALE / float(tau_l1[0])
+    s11 = STATIC_SCALE / float(tau_l1[1])
+
+    mask0_l0 = np.zeros((PHYSICAL, MAX_LEN, MAX_LEN), dtype=np.float32)
+    mask1_l0 = np.zeros((PHYSICAL, MAX_LEN, MAX_LEN), dtype=np.float32)
+    mask0_l1 = np.zeros((PHYSICAL, MAX_LEN, MAX_LEN), dtype=np.float32)
+    mask1_l1 = np.zeros((PHYSICAL, MAX_LEN, MAX_LEN), dtype=np.float32)
+
+    for lane in range(B):
+        attn_1d = attention_mask[lane].cpu().numpy().astype(np.float32)
+        keymask = build_keymask_tile(attn_1d)
+        mask0_l0[lane] = keymask * s00
+        mask1_l0[lane] = keymask * s01
+        mask0_l1[lane] = keymask * s10
+        mask1_l1[lane] = keymask * s11
+
+    print("Initializing FHE engine...")
+    engine = fhe.GLEngine(shape=(PHYSICAL, BLOCK, BLOCK), mode="gpu")
     sk = engine.create_secret_key()
-    mult_key = engine.create_matrix_multiplication_key(sk)
-    hadamard_key = engine.create_hadamard_multiplication_key(sk)
-    transposition_key = engine.create_transposition_key(sk)
-    
-    # 加密
-    print("   Encrypting...")
-    x_packed = np.tile(x_plain_np, (NUM_HEADS, 1, 1)) 
-    input_enc = BlockMatrix.encrypt_inputs(engine, x_packed, sk, block_size=64)
-    
-    # 加载 FHE 层
-    bert_l0 = FHEBertTinyEncoder(engine, mult_key, hadamard_key, transposition_key, weights_path, layer_idx=0)
-    bert_l1 = FHEBertTinyEncoder(engine, mult_key, hadamard_key, transposition_key, weights_path, layer_idx=1)
-    
-    # 执行层
-    print("   Executing Layer 0...")
-    out_l0 = bert_l0.forward_one_layer(input_enc)
-    
-    print("   Executing Layer 1...")
-    out_l1 = bert_l1.forward_one_layer(out_l0)
-    
-    # 解密与提取
-    print("\n4. Decrypting & Comparing...")
-    w_data = np.load(weights_path)
-    w_cls = w_data["classifier.weight"]
-    b_cls = w_data["classifier.bias"]
-    
-    correct_count = 0
-    decrypted_full = np.zeros(x_packed.shape, dtype=np.float32)
-    
-    for r in range(out_l1.r_grid):
-        for c in range(out_l1.c_grid):
-            blk = out_l1.blocks[r][c]
-            if blk is not None:
-                blk_np = engine.decrypt(blk, sk)
-                r0, r1 = r*64, (r+1)*64
-                c0, c1 = c*64, (c+1)*64
-                real_r = min(32, r1) - r0
-                real_c = min(128, c1) - c0
-                if real_r > 0 and real_c > 0:
-                    decrypted_full[:, r0:r0+real_r, c0:c0+real_c] = blk_np[:, :real_r, :real_c]
+    keys = {
+        "mult": engine.create_matrix_multiplication_key(sk),
+        "had": engine.create_hadamard_multiplication_key(sk),
+        "trans": engine.create_transposition_key(sk),
+    }
 
-    print(f"\n{'idx':<5} | {'Sentence':<25} | {'PT(NoMask)':<10} | {'FHE ID':<8} | {'Match?':<10}")
-    print("-" * 75)
-    
-    for i in range(BATCH_SIZE):
-        cls_vec = decrypted_full[i, 0, :] 
-        fhe_logits = np.dot(cls_vec, w_cls.T) + b_cls
-        fhe_pred = np.argmax(fhe_logits)
-        
-        # 对比对象是无 Mask 的 PyTorch 结果
-        pt_target = pt_preds_nomask[i]
-        
-        is_match = (fhe_pred == pt_target)
-        if is_match: correct_count += 1
-        
-        if i < 10 or i == BATCH_SIZE - 1:
-            short_sent = (sentences[i][:22] + '..') if len(sentences[i]) > 22 else sentences[i]
-            match_str = "✅" if is_match else "❌"
-            print(f"{i:<5} | {short_sent:<25} | {pt_target:<10} | {fhe_pred:<8} | {match_str:<10}")
+    enc0 = FHEBertTinyEncoder(engine, keys["mult"], keys["had"], keys["trans"], weights_path, layer_idx=0)
+    enc1 = FHEBertTinyEncoder(engine, keys["mult"], keys["had"], keys["trans"], weights_path, layer_idx=1)
 
-    agreement_rate = (correct_count / BATCH_SIZE) * 100
-    print("-" * 75)
-    print(f"🏆 Final Agreement Rate: {agreement_rate:.2f}% ({correct_count}/{BATCH_SIZE})")
-    
-    if agreement_rate > 99.0:
-        print("\n🎉 SUCCESS: FHE matches Plaintext (No Mask) perfectly!")
-    else:
-        print("\n⚠️ Warning: Still mismatching. Check Damping or Calculation logic.")
+    x_enc = BlockMatrix.encrypt_inputs(engine, x_pack, sk, block_size=BLOCK)
+    out0 = enc0.forward_one_layer(x_enc, attention_mask=(mask0_l0, mask1_l0))
+    out1 = enc1.forward_one_layer(out0, attention_mask=(mask0_l1, mask1_l1))
+
+    r0 = engine.decrypt(out1.blocks[0][0], sk)
+    r1 = engine.decrypt(out1.blocks[0][1], sk)
+
+    fhe_pred = []
+    for lane in range(B):
+        cls_0 = r0[lane, 0, :]
+        cls_1 = r1[lane, 0, :]
+        cls = np.concatenate([cls_0, cls_1], axis=0).astype(np.float32)
+        logits = cls @ W_cls.T + b_cls
+        fhe_pred.append(int(np.argmax(logits)))
+
+    print("\nidx | sentence                     | plain | fhe | match")
+    print("-" * 65)
+    matches = 0
+    for i, text in enumerate(TEST_SENTENCES):
+        p = int(pt_pred[i])
+        f = int(fhe_pred[i])
+        ok = p == f
+        matches += int(ok)
+        short = (text[:24] + "..") if len(text) > 24 else text
+        print(f"{i:>3} | {short:<27} | {p:>5} | {f:>3} | {str(ok)}")
+
+    print("-" * 65)
+    print(f"Agreement: {matches}/{B} = {matches/B:.3f}")
+
 
 if __name__ == "__main__":
     main()

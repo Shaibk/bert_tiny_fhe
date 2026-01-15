@@ -2,11 +2,14 @@ import torch
 import os
 import sys
 import numpy as np
+import argparse
 from transformers import AutoTokenizer
 
 # 添加项目路径
 sys.path.append(os.path.join(os.path.dirname(__file__), ".."))
 from experiments.accuracy_first.plaintext.model_plain_tinybert import PlainTinyBert
+from experiments.accuracy_first.plaintext.dataset_registry import add_dataset_args, normalize_dataset_name
+from experiments.accuracy_first.plaintext.artifact_utils import build_ckpt_path
 
 # CLINC150 部分标签映射 (用于验证)
 ID2LABEL = {
@@ -14,10 +17,26 @@ ID2LABEL = {
     20: "freeze_account", 
 }
 
+def parse_args():
+    parser = argparse.ArgumentParser(description="Plaintext prediction demo.")
+    parser.add_argument("--text", default="freeze my account")
+    add_dataset_args(parser, default_dataset="clinc150")
+    return parser.parse_args()
+
+
 def main():
+    args = parse_args()
     # 1. 路径配置
     project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-    model_path = os.path.join(project_root, "experiments/accuracy_first/plaintext/student_8level.pt")
+    dataset_name = normalize_dataset_name(args.dataset)
+    if dataset_name != "clinc150":
+        ID2LABEL.clear()
+    model_path = build_ckpt_path(
+        os.path.join(project_root, "experiments/accuracy_first/plaintext"),
+        dataset_name,
+        args.dataset_version,
+        "student_kd_plain",
+    )
     
     print(f"Loading PyTorch Model: {model_path}")
     
@@ -38,7 +57,7 @@ def main():
     model.eval()
 
     # 3. 准备输入
-    text = "freeze my account"
+    text = args.text
     print(f"Input Text: '{text}'")
     
     tokenizer = AutoTokenizer.from_pretrained("google/bert_uncased_L-2_H-128_A-2")

@@ -1,4 +1,5 @@
 import os
+import argparse
 import torch
 import torch.nn as nn
 from transformers import (
@@ -6,11 +7,22 @@ from transformers import (
     AutoModelForSequenceClassification, # 直接使用 HF 的标准 BERT 类
     get_linear_schedule_with_warmup
 )
-from .data_clinc150 import build_clinc150_dataloaders
+from .dataset_registry import add_dataset_args, build_dataloaders, normalize_dataset_name
+from .artifact_utils import build_ckpt_path
 
 THIS_DIR = os.path.dirname(os.path.abspath(__file__))
 
+def parse_args():
+    parser = argparse.ArgumentParser(description="Train teacher model.")
+    add_dataset_args(parser, default_dataset="clinc150")
+    parser.add_argument("--max-len", type=int, default=32)
+    parser.add_argument("--batch-size", type=int, default=64)
+    parser.add_argument("--epochs", type=int, default=20)
+    return parser.parse_args()
+
+
 def main():
+    args = parse_args()
     device = "cuda" if torch.cuda.is_available() else "cpu"
     print(f"Using device: {device}")
 
@@ -20,17 +32,21 @@ def main():
     print("A: start")
     print("B: before tokenizer")
     tokenizer = AutoTokenizer.from_pretrained(model_id, use_fast=True)
-    max_len = 32
-    batch_size = 64
-    epochs = 20  # 预训练模型收敛很快，20轮足够了
+    max_len = args.max_len
+    batch_size = args.batch_size
+    epochs = args.epochs  # 预训练模型收敛很快，20轮足够了
 
     # 2. 加载数据
     print("C: after tokenizer")
     print("D: before dataloader")
-    train_loader, val_loader, num_classes = build_clinc150_dataloaders(
+    dataset_name = normalize_dataset_name(args.dataset)
+    train_loader, val_loader, num_classes = build_dataloaders(
+        dataset_name,
         tokenizer=tokenizer,
         max_len=max_len,
         batch_size=batch_size,
+        dataset_config=args.dataset_config,
+        dataset_source=args.dataset_source,
     )
 
     # 3. 加载预训练的 Teacher (God Mode)
@@ -57,7 +73,7 @@ def main():
     # 注意：这里我们保存为同样的路径，方便 Student 读取
     # 但因为这是 HF 格式，Student 加载时需要一点小技巧（或者我们还是把 Teacher 转换一下）
     # 为了最简单，我们这里直接保存这个 HF 模型，Student 训练时也用 HF 接口加载 Teacher 即可
-    save_path = os.path.join(THIS_DIR, "teacher_pretrained_bert_tiny.pt")
+    save_path = build_ckpt_path(THIS_DIR, dataset_name, args.dataset_version, "teacher_pretrained_bert_tiny")
 
     print(f"Start Fine-tuning Teacher...")
 

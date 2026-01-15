@@ -1,11 +1,13 @@
 import os
+import argparse
 import torch
 import torch.nn as nn
 from transformers import AutoTokenizer, AutoModelForSequenceClassification, get_linear_schedule_with_warmup
 
 from .model_plain_tinybert import PlainTinyBert
 from .distill_losses import kd_logits_kl
-from .data_clinc150 import build_clinc150_dataloaders
+from .dataset_registry import add_dataset_args, build_dataloaders, normalize_dataset_name
+from .artifact_utils import build_ckpt_path
 
 THIS_DIR = os.path.dirname(os.path.abspath(__file__))
 
@@ -30,7 +32,17 @@ def evaluate_student(model, val_loader, device):
     return correct / total
 
 
+def parse_args():
+    parser = argparse.ArgumentParser(description="Train student with KD.")
+    add_dataset_args(parser, default_dataset="clinc150")
+    parser.add_argument("--max-len", type=int, default=32)
+    parser.add_argument("--batch-size", type=int, default=128)
+    parser.add_argument("--epochs", type=int, default=60)
+    return parser.parse_args()
+
+
 def main():
+    args = parse_args()
     device = "cuda" if torch.cuda.is_available() else "cpu"
     print(f"Using device: {device}")
 
@@ -38,15 +50,19 @@ def main():
     model_id = "google/bert_uncased_L-2_H-128_A-2"
     tokenizer = AutoTokenizer.from_pretrained(model_id, use_fast=True)
 
-    max_len = 32
-    batch_size = 128
-    epochs = 60
+    max_len = args.max_len
+    batch_size = args.batch_size
+    epochs = args.epochs
 
-    train_loader, val_loader, num_classes = build_clinc150_dataloaders(
+    dataset_name = normalize_dataset_name(args.dataset)
+    train_loader, val_loader, num_classes = build_dataloaders(
+        dataset_name,
         tokenizer=tokenizer,
         max_len=max_len,
         batch_size=batch_size,
         num_workers=0,
+        dataset_config=args.dataset_config,
+        dataset_source=args.dataset_source,
     )
 
     print(f"Loading pre-trained weights from {model_id}...")
@@ -88,7 +104,7 @@ def main():
 
     # ===== 4. Train =====
     best_acc = 0.0
-    save_path = os.path.join(THIS_DIR, "student_kd_plain.pt")
+    save_path = build_ckpt_path(THIS_DIR, dataset_name, args.dataset_version, "student_kd_plain")
 
     print("Start Training Student (KD only)...")
 

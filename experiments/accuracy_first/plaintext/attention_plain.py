@@ -80,6 +80,6 @@ class Attn2Quad(nn.Module):
         #print("PT head0 row0 sum:", attn_scores[0,0,0,:].sum().item())
         #print("PT head1 row0 sum:", attn_scores[0,1,0,:].sum().item())
         #print("PT head0/1 row0 max:", attn_scores[0,0,0,:].max().item(), attn_scores[0,1,0,:].max().item())
-        print("runtime tau:", self.tau.detach().cpu().numpy())
+        # No runtime prints here; keep training logs clean.
 
         return out, attn_scores
